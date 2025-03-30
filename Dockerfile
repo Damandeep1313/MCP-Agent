@@ -10,15 +10,15 @@
     # Copy only package files first (for efficient caching)
     COPY package*.json ./
     
-    # Install dependencies
+    # Install only production dependencies
     RUN npm install --production
     
-    # Copy the rest of your code
+    # Copy the rest of the source code
     COPY . .
     
     # -----------------------------------------------------
     # 2) RUNTIME STAGE
-    #    Only copy node_modules and the code you need.
+    #    Only copy node_modules and app code you need.
     # -----------------------------------------------------
     FROM node:18-alpine
     
@@ -27,18 +27,17 @@
     
     WORKDIR /app
     
-    # Copy node_modules and server code from build stage
+    # Copy node_modules and code from build stage
     COPY --from=build /app/node_modules ./node_modules
-    COPY --from=build /app/server.js .
-    COPY --from=build /app/.env ./
-    # (If you have other .js files, static assets, etc., copy them similarly)
+    COPY --from=build /app/server.js ./
+    # COPY other required files here if needed (e.g., routes, utils)
     
     # Switch to non-root user
     USER nodeuser
     
     # Expose the port your server listens on
-    EXPOSE 3000
+    EXPOSE 2002
     
-    # Define the command to run the app
+    # Run the app
     CMD ["node", "server.js"]
     
