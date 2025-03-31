@@ -115,7 +115,7 @@ app.post("/ask", async (req, res) => {
     console.log("Headers:", req.headers);
     console.log("Body:", req.body);
     console.log("==========================");
-    const user_id = req.header("x-user-id");
+    const user_id = req.header("x-uid");
     const conversation_id = req.header("x-conversation-id") || "default";
 
     // Body
@@ -124,7 +124,7 @@ app.post("/ask", async (req, res) => {
     if (!user_id || !query) {
       return res
         .status(400)
-        .json({ error: "Missing x-user-id header or 'query' in body" });
+        .json({ error: "Missing x-uid header or 'query' in body" });
     }
 
     console.log(`\n🔎 /ask | user=${user_id} | convo=${conversation_id} | query="${query}"`);
