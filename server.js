@@ -111,6 +111,10 @@ app.use(bodyParser.json());
 app.post("/ask", async (req, res) => {
   try {
     // Headers
+    console.log("\n==== Incoming Request ====");
+    console.log("Headers:", req.headers);
+    console.log("Body:", req.body);
+    console.log("==========================");
     const user_id = req.header("x-user-id");
     const conversation_id = req.header("x-conversation-id") || "default";
 
