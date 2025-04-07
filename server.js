@@ -1,5 +1,9 @@
 /*******************************************************
  * server.js
+ *
+ * - If query includes "emailed" + "successfully": set connected_already='true'
+ * - If query includes "emailed" + "failed": set connected_already='false'
+ * - Otherwise, do store/search/history/ask logic as before.
  *******************************************************/
 require("dotenv").config();
 const express = require("express");
@@ -25,19 +29,48 @@ const db = createClient({
   authToken: DB_AUTH_TOKEN,
 });
 
-// OpenAI Client (for embeddings only)
+// OpenAI Client
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 /*******************************************************
- * 2. HELPER: Generate Embedding
- *    (Uses OpenAI's Embeddings for semantic search)
+ * 2. HELPER: Chat-based LLM call to parse messy "store"
+ *    text into a structured command: "store name=..., email=..., ..."
+ *******************************************************/
+async function parseWithLLM(rawText) {
+  const systemPrompt = `
+You are a helpful parser that extracts contact information from natural language. 
+When the user has written something like "store some info for John, his email is john@xyz.com", 
+you must convert it into a single line format like:
+
+store name=John; email=john@xyz.com; company=...; last_contacted=...;
+
+Include whichever fields you find (name, email, linkedin, company, last_contacted).
+If any field is not found, omit it. Do not add extra text, just the line above.
+Remember: never skip email if the user provided it explicitly.
+`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: rawText },
+  ];
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-3.5-turbo",
+    messages: messages,
+    temperature: 0.2,
+  });
+
+  return response.choices[0].message.content;
+}
+
+/*******************************************************
+ * 3. HELPER: Generate Embedding (for semantic search)
  *******************************************************/
 async function generateEmbedding(text) {
   const response = await openai.embeddings.create({
     model: "text-embedding-ada-002",
     input: text,
   });
-
   const vector = response?.data?.[0]?.embedding;
   if (!vector || !Array.isArray(vector)) {
     throw new Error("Embedding generation failed or returned invalid data");
@@ -46,7 +79,7 @@ async function generateEmbedding(text) {
 }
 
 /*******************************************************
- * 3. HELPER: Convert Arrays <-> Buffer
+ * 4. HELPER: Convert Arrays <-> Buffer
  *******************************************************/
 function floatArrayToBuffer(arr) {
   const float32Arr = new Float32Array(arr);
@@ -64,7 +97,7 @@ function bufferToFloatArray(buf) {
 }
 
 /*******************************************************
- * 4. HELPER: Cosine Similarity
+ * 5. HELPER: Cosine Similarity
  *******************************************************/
 function cosineSimilarity(vecA, vecB) {
   if (!vecA || !vecB || vecA.length !== vecB.length) {
@@ -82,85 +115,260 @@ function cosineSimilarity(vecA, vecB) {
 }
 
 /*******************************************************
- * TABLE SCHEMA (in libSQL):
-   CREATE TABLE IF NOT EXISTS messages (
-     id INTEGER PRIMARY KEY AUTOINCREMENT,
-     user_id TEXT NOT NULL,
-     conversation_id TEXT NOT NULL,
-     content TEXT NOT NULL,
-     embedding BLOB NOT NULL,
-     created_at TEXT NOT NULL
-   );
+ * 6. PARSE THE "store" COMMAND (like "store name=..., email=...")
  *******************************************************/
+function parseFields(storeString) {
+  // remove "store" prefix if present
+  let text = storeString.replace(/^store[:\s]*/i, "").trim();
+
+  const parts = text.split(";");
+  const result = {
+    name: null,
+    email: null,
+    linkedin: null,
+    company: null,
+    last_contacted: null,
+    content: text, // fallback
+  };
+
+  parts.forEach(part => {
+    const [k, ...rest] = part.split("=");
+    if (!k || rest.length === 0) return;
+
+    const key = k.trim().toLowerCase();
+    const value = rest.join("=").trim();
+
+    if (key === "name") result.name = value;
+    if (key === "email") result.email = value;
+    if (key === "linkedin") result.linkedin = value;
+    if (key === "company") result.company = value;
+    if (key === "last_contacted") result.last_contacted = value;
+  });
+
+  return result;
+}
 
 /*******************************************************
- * 5. EXPRESS APP
+ * 7. Naive Email Extractor (for "emailed X successfully/failed")
+ *******************************************************/
+function extractEmailFromText(text) {
+  const emailRegex = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/;
+  const match = text.match(emailRegex);
+  return match ? match[0] : null;
+}
+
+/*******************************************************
+ * 8. EXPRESS APP + /ask ENDPOINT
  *******************************************************/
 const app = express();
 app.use(bodyParser.json());
 
-/*******************************************************
- * (A) SINGLE ENDPOINT: /ask
- * 
- * We detect the user’s intent by keywords:
- *   - "store"   => store the entire query minus the word "store"
- *   - "search"  => search for the entire query minus the word "search"
- *   - "history" => return conversation
- *   - otherwise => "ask" top 3 matches
- *******************************************************/
 app.post("/ask", async (req, res) => {
   try {
-    // Headers
     console.log("\n==== Incoming Request ====");
     console.log("Headers:", req.headers);
     console.log("Body:", req.body);
     console.log("==========================");
+
     const user_id = req.header("x-uid");
     const conversation_id = req.header("x-conversation-id") || "default";
-
-    // Body
     const { query } = req.body;
 
     if (!user_id || !query) {
-      return res
-        .status(400)
-        .json({ error: "Missing x-uid header or 'query' in body" });
+      return res.status(400).json({ error: "Missing x-uid header or 'query' in body" });
     }
 
     console.log(`\n🔎 /ask | user=${user_id} | convo=${conversation_id} | query="${query}"`);
-
     const lower = query.toLowerCase();
 
     /****************************************************
-     * 1) STORE if query includes "store"
+     * A) "emailed X successfully" => connected_already='true'
+     * B) "emailed X failed" => connected_already='false'
      ****************************************************/
-    if (lower.includes("store")) {
-      console.log("[ACTION] Storing data => we embed and insert into DB.");
-      // Remove "store" from the string to get the actual content
-      // (simple approach—improve if you want more sophisticated parsing)
-      const contentToStore = query.replace(/store/i, "").trim();
-
-      if (!contentToStore) {
-        return res.json({ error: "No content to store after removing 'store'." });
+    if (lower.includes("emailed")) {
+      const email = extractEmailFromText(query);
+      if (!email) {
+        return res.json({ error: "No email found in your statement." });
       }
 
-      // Insert
-      const createdAt = new Date().toISOString();
-      const embeddingArray = await generateEmbedding(contentToStore);
+      // check if it's "successfully" or "failed"
+      if (lower.includes("successfully")) {
+        console.log(`[ACTION] Setting connected_already='true' for ${email}`);
+        const { rows } = await db.execute({
+          sql: "SELECT * FROM messages WHERE email=? LIMIT 1",
+          args: [email],
+        });
+        if (!rows.length) {
+          return res.json({ status: "not_found", message: `No record found for email=${email}.` });
+        }
+        await db.execute({
+          sql: "UPDATE messages SET connected_already='true' WHERE email=?",
+          args: [email],
+        });
+        return res.json({
+          status: "ok",
+          message: `Set connected_already='true' for email=${email}`,
+        });
+      }
+
+      if (lower.includes("failed")) {
+        console.log(`[ACTION] Setting connected_already='false' for ${email}`);
+        const { rows } = await db.execute({
+          sql: "SELECT * FROM messages WHERE email=? LIMIT 1",
+          args: [email],
+        });
+        if (!rows.length) {
+          return res.json({ status: "not_found", message: `No record found for email=${email}.` });
+        }
+        await db.execute({
+          sql: "UPDATE messages SET connected_already='false' WHERE email=?",
+          args: [email],
+        });
+        return res.json({
+          status: "ok",
+          message: `Set connected_already='false' for email=${email}`,
+        });
+      }
+    }
+
+    /****************************************************
+     * 1) "STORE" DETECTION + LLM PARSING
+     ****************************************************/
+    if (lower.includes("store")) {
+      // Step A: We ask LLM to parse the messy user text
+      console.log("[ACTION] Interpreting user text with LLM...");
+      const structuredCommand = await parseWithLLM(query);
+      console.log("LLM structured command:", structuredCommand);
+
+      // Step B: Now parse the structured command
+      const parsed = parseFields(structuredCommand);
+      const {
+        name,
+        email,
+        linkedin,
+        company,
+        last_contacted,
+        content,
+      } = parsed;
+
+      // If there's literally nothing to store, bail out
+      if (!email && !name && !linkedin && !company && !content) {
+        return res.json({ error: "LLM produced no fields to store." });
+      }
+
+      // Step C: Generate embedding
+      const embeddingArray = await generateEmbedding(content);
       const embeddingBuf = floatArrayToBuffer(embeddingArray);
 
-      await db.execute({
-        sql: `
-          INSERT INTO messages (user_id, conversation_id, content, embedding, created_at)
-          VALUES (?, ?, ?, ?, ?);
-        `,
-        args: [user_id, conversation_id, contentToStore, embeddingBuf, createdAt],
+      // Step D: If no email => always insert a new record
+      if (!email) {
+        const createdAt = new Date().toISOString();
+        const result = await db.execute({
+          sql: `
+            INSERT INTO messages (
+              user_id, conversation_id,
+              name, email, linkedin, company, last_contacted,
+              content, embedding, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+          `,
+          args: [
+            user_id,
+            conversation_id,
+            name,
+            null,
+            linkedin,
+            company,
+            last_contacted,
+            content,
+            embeddingBuf,
+            createdAt,
+          ],
+        });
+
+        return res.json({
+          status: "ok",
+          message: `Inserted new record (no email) [rowid=${result.lastInsertRowid}].`,
+        });
+      }
+
+      // Step E: If we do have an email => unify by email
+      const { rows } = await db.execute({
+        sql: "SELECT * FROM messages WHERE email = ? LIMIT 1",
+        args: [email],
       });
 
-      return res.json({
-        status: "ok",
-        message: `Data stored: "${contentToStore}"`,
-      });
+      if (rows.length > 0) {
+        // Found existing => partial update
+        const existingRow = rows[0];
+        console.log(`[ACTION] Found existing record with email=${email}, id=${existingRow.id}`);
+
+        await db.execute({
+          sql: `
+            UPDATE messages
+            SET
+              user_id = ?,
+              conversation_id = ?,
+              name = CASE WHEN name IS NULL THEN ? ELSE name END,
+              linkedin = CASE WHEN linkedin IS NULL THEN ? ELSE linkedin END,
+              company = CASE WHEN company IS NULL THEN ? ELSE company END,
+              last_contacted = CASE WHEN last_contacted IS NULL THEN ? ELSE last_contacted END,
+              content = ?,
+              embedding = ?,
+              created_at = ?
+            WHERE email = ?
+          `,
+          args: [
+            user_id,
+            conversation_id,
+            name,
+            linkedin,
+            company,
+            last_contacted,
+            content,
+            embeddingBuf,
+            new Date().toISOString(),
+            email,
+          ],
+        });
+
+        return res.json({
+          status: "ok",
+          message: `Updated existing record (partial) for email=${email}.`,
+        });
+      } else {
+        // Insert new
+        console.log("[ACTION] No record found, inserting new row (email).");
+
+        const createdAt = new Date().toISOString();
+        const result = await db.execute({
+          sql: `
+            INSERT INTO messages (
+              user_id, conversation_id,
+              name, email, linkedin, company, last_contacted,
+              content, embedding, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+          `,
+          args: [
+            user_id,
+            conversation_id,
+            name,
+            email,
+            linkedin,
+            company,
+            last_contacted,
+            content,
+            embeddingBuf,
+            createdAt,
+          ],
+        });
+
+        return res.json({
+          status: "ok",
+          message: `Inserted new record for email=${email} [rowid=${result.lastInsertRowid}].`,
+        });
+      }
     }
 
     /****************************************************
@@ -168,7 +376,6 @@ app.post("/ask", async (req, res) => {
      ****************************************************/
     if (lower.includes("search")) {
       console.log("[ACTION] Searching data => we embed and compare.");
-      // Remove "search" from the string
       const searchQuery = query.replace(/search/i, "").trim();
 
       if (!searchQuery) {
@@ -182,7 +389,10 @@ app.post("/ask", async (req, res) => {
       });
 
       if (!rows.length) {
-        return res.json({ results: [], note: "No messages found for that user/conversation." });
+        return res.json({
+          results: [],
+          note: "No messages found for that user/conversation.",
+        });
       }
 
       const scored = rows.map((row) => {
@@ -210,10 +420,12 @@ app.post("/ask", async (req, res) => {
      ****************************************************/
     if (lower.includes("history")) {
       console.log("[ACTION] Returning conversation history.");
-
       const { rows } = await db.execute({
         sql: `
-          SELECT id, content, created_at
+          SELECT
+            id, name, email, linkedin, company,
+            last_contacted, content, created_at,
+            connected_already
           FROM messages
           WHERE user_id = ? AND conversation_id = ?
           ORDER BY created_at ASC;
