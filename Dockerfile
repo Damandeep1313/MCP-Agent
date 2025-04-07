@@ -39,5 +39,5 @@
     EXPOSE 2002
     
     # Run the app
-    CMD ["node", "server.js"]
+    CMD ["node", "su.js"]
     
