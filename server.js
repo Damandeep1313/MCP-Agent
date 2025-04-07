@@ -260,37 +260,49 @@ app.post("/ask", async (req, res) => {
       const embeddingArray = await generateEmbedding(content);
       const embeddingBuf = floatArrayToBuffer(embeddingArray);
 
-      // Step D: If no email => always insert a new record
-      if (!email) {
+        // Step D: If no email AND no linkedin/company/name => treat as general log, store it
+    if (!email && !linkedin && !name && !company) {
+        console.log("[INFO] No contact fields found. Storing as a general message log.");
+    
         const createdAt = new Date().toISOString();
         const result = await db.execute({
-          sql: `
+        sql: `
             INSERT INTO messages (
-              user_id, conversation_id,
-              name, email, linkedin, company, last_contacted,
-              content, embedding, created_at
+            user_id, conversation_id,
+            name, email, linkedin, company, last_contacted,
+            content, embedding, created_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-          `,
-          args: [
+        `,
+        args: [
             user_id,
             conversation_id,
-            name,
             null,
-            linkedin,
-            company,
-            last_contacted,
+            null,
+            null,
+            null,
+            null,
             content,
             embeddingBuf,
             createdAt,
-          ],
+        ],
         });
-
+    
         return res.json({
-          status: "ok",
-          message: `Inserted new record (no email) [rowid=${result.lastInsertRowid}].`,
+        status: "ok",
+        message: `Stored general message log [rowid=${result.lastInsertRowid}].`,
         });
-      }
+    }
+    
+    // If email is missing but other contact fields are present, skip
+    if (!email) {
+        console.log("[SKIP] Contact info provided without email. Skipping insert.");
+        return res.json({
+        status: "skipped",
+        message: "Missing email for contact. Insert skipped.",
+        });
+    }
+    
 
       // Step E: If we do have an email => unify by email
       const { rows } = await db.execute({
