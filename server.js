@@ -223,12 +223,14 @@ app.post("/ask", async (req, res) => {
         lower.includes("failed") ||
         lower.includes("fail") ||
         lower.includes("unsuccessful")
-          )) {
-        console.log(`[ACTION] Setting connected_already='false' for ${email}`);
-        const { rows } = await db.execute({
-          sql: "SELECT * FROM messages WHERE email=? LIMIT 1",
-          args: [email],
-        });
+        ))
+        ) {
+  console.log(`[ACTION] Setting connected_already='false' for ${email}`);
+  const { rows } = await db.execute({
+    sql: "SELECT * FROM messages WHERE email=? LIMIT 1",
+    args: [email],
+  });
+
         if (!rows.length) {
           return res.json({ status: "not_found", message: `No record found for email=${email}.` });
         }
