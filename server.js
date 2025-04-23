@@ -195,7 +195,9 @@ app.post("/ask", async (req, res) => {
       if (
         lower.includes("successfully") ||
         lower.includes("delivered") ||
-        lower.includes("completed")
+        lower.includes("completed") ||
+        lower.includes("connected_already = true") ||
+        (lower.includes("connected_already") && lower.includes("true"))
           ) {
         console.log(`[ACTION] Setting connected_already='true' for ${email}`);
         const { rows } = await db.execute({
@@ -215,7 +217,13 @@ app.post("/ask", async (req, res) => {
         });
       }
 
-      if (lower.includes("failed")) {
+      if (
+        lower.includes("failed") ||
+        (lower.includes("connected_already") && (
+        lower.includes("failed") ||
+        lower.includes("fail") ||
+        lower.includes("unsuccessful")
+          )) {
         console.log(`[ACTION] Setting connected_already='false' for ${email}`);
         const { rows } = await db.execute({
           sql: "SELECT * FROM messages WHERE email=? LIMIT 1",
