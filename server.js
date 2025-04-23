@@ -192,7 +192,11 @@ app.post("/ask", async (req, res) => {
       }
 
       // check if it's "successfully" or "failed"
-      if (lower.includes("successfully")) {
+      if (
+        lower.includes("successfully") ||
+        lower.includes("delivered") ||
+        lower.includes("completed")
+          ) {
         console.log(`[ACTION] Setting connected_already='true' for ${email}`);
         const { rows } = await db.execute({
           sql: "SELECT * FROM messages WHERE email=? LIMIT 1",
